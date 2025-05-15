@@ -1,0 +1,138 @@
+---
+title: "Belief Diffusion Simulation - Optimized"
+author: "Your Name"
+format:
+  html: default
+---
+
+```{r setup}
+# Load and install required packages for data manipulation, modeling, and visualization
+packages <- c("readxl", "igraph", "R6", "dplyr", "tidyr", "ggplot2", "profvis", "microbenchmark", "data.table")
+install_if_missing <- function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cloud.r-project.org")
+    library(pkg, character.only = TRUE)
+  }
+}
+lapply(packages, install_if_missing)
+
+# A simple null‑coalescing helper
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+```
+
+```{r read vertex}
+# Read vertex list (semantic network)
+node_file <- "C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S3-Semantic_Network_Ecosystem_Services_25.01.2022.csv"
+nodes_df  <- fread(node_file, skip = 1)
+
+# Simulate edges from shared group membership
+edges_sim <- nodes_df[, .(Vertex, Group = `Vertex Group`)] |>
+  na.omit() |>
+  group_by(Group) |>
+  summarise(pairs = combn(Vertex, 2, simplify = FALSE), .groups = "drop") |>
+  pull(pairs) |>
+  do.call(what = rbind, args = _) |>
+  as.data.frame()
+colnames(edges_sim) <- c("from", "to")
+
+# Load additional attribute tables
+s1 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S1-SNA_CA_Ecosystem_Services_25.01.2022.csv", skip = 1)
+s2 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S2-SNA_CA_Ecosystem_Services_03.02.2022.csv",  skip = 1)
+s4 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S4-Semantic_Network_Ecosystem_Services_03.02.2022.csv", skip = 1)
+
+# Build igraph object and attach attributes
+G <- graph_from_data_frame(edges_sim, directed = TRUE, vertices = nodes_df)
+V(G)$centrality <- as.numeric(nodes_df$Betweenness)
+V(G)$belief     <- "neutral"
+V(G)$cluster    <- as.integer(as.factor(nodes_df$`Vertex Group`))
+
+# Identify brokers (top 10 % betweenness)
+cutoff          <- quantile(V(G)$centrality, 0.90, na.rm = TRUE)
+V(G)$is_broker  <- V(G)$centrality >= cutoff
+
+# Attach budgets from table S2
+keywords        <- tolower(V(G)$name)
+lookup          <- setNames(as.numeric(s2$Salience), tolower(s2$Word))
+V(G)$budget     <- lookup[keywords]
+V(G)$budget[is.na(V(G)$budget)] <- mean(V(G)$budget, na.rm = TRUE)
+
+# Pre‑compute neighbour lists for speed
+neighbor_lists <- setNames(lapply(V(G), function(v) names(neighbors(G, v, mode = "all"))), V(G)$name)
+```
+
+```{r agent classes}
+# Base probabilistic agent --------------------------------------------------
+AgentWithBeliefProb <- R6Class(
+  "AgentWithBeliefProb",
+  public = list(
+    id = NULL, name = NULL, belief = "neutral", centrality = NULL, budget = NULL,
+    initialize = function(id, name) {
+      self$id   <- id
+      self$name <- name
+    },
+    update_belief = function(nb, nc = NULL, strategy = "frequency") {
+      if (length(nb) == 0) return()
+
+      if (strategy == "frequency") {
+        freq <- table(nb[nb != "neutral"])
+        if (length(freq) > 0)
+          self$belief <- sample(names(freq), 1, prob = freq / sum(freq))
+
+      } else if (strategy == "success" && !is.null(nc)) {
+        top <- nb[which.max(nc)]
+        if (!is.na(top) && top != "neutral") self$belief <- top
+      }
+    }
+  )
+)
+
+# Variants ------------------------------------------------------------------
+AgentLooser    <- R6Class("AgentLooser",    inherit = AgentWithBeliefProb)
+AgentMajority  <- R6Class("AgentMajority",  inherit = AgentWithBeliefProb, public = list(
+  update_belief = function(nb, ...) {
+    tab <- table(nb[nb != "neutral"])
+    if (length(tab) > 0 && max(tab) >= 2)
+      self$belief <- names(which.max(tab))
+  }
+))
+AgentThreshold <- R6Class("AgentThreshold", inherit = AgentWithBeliefProb, public = list(
+  update_belief = function(nb, ...) {
+    if (mean(nb == "supportive") > 0.2)      self$belief <- "supportive"
+    else if (mean(nb == "resistant") > 0.2)  self$belief <- "resistant"
+  }
+))
+AgentBroker    <- R6Class("AgentBroker",    inherit = AgentWithBeliefProb, public = list(
+  update_belief = function(nb, ...) {
+    tab <- table(nb[nb != "neutral"])
+    if (any(nb == "neutral") && runif(1) < 0.6) {
+      if ("supportive" %in% names(tab)) self$belief <- "supportive"
+    } else if (length(tab) > 0) {
+      self$belief <- sample(names(tab), 1, prob = tab / sum(tab))
+    }
+  }
+))
+```
+
+```{r Visualise Results}
+
+# Summarise beliefs by time & scenario
+belief_summary <- results_all |>
+  group_by(time, scenario, belief) |>
+  summarise(count = n(), .groups = "drop") |>
+  group_by(time, scenario) |>
+  mutate(prop = count / sum(count))
+
+# Faceted line plot ---------------------------------------------------------
+ggplot(belief_summary, aes(time, prop, colour = belief)) +
+  geom_line(linewidth = 1.2) +
+  facet_wrap(~scenario) +
+  scale_colour_manual(values = c(neutral = "grey", supportive = "blue", resistant = "red")) +
+  labs(
+    title = "Belief Diffusion by Scenario",
+    x     = "Time step",
+    y     = "Proportion of agents",
+    colour= "Belief"
+  ) +
+  theme_minimal()
+
+```
