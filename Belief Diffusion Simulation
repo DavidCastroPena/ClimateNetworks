@@ -1,300 +1,394 @@
 ---
-title: "Belief Diffusion Simulation - Optimized"
+title: "Belief Diffusion Simulation - Fixed Network Connectivity"
 author: "David Castro"
-format: html
+format:
+  html: default
 ---
 
-## Install and Load Required Packages
-
-```{r}
-# Install if not already installed
-packages <- c("readxl", "igraph", "R6", "dplyr", "tidyr", "ggplot2", "profvis", "microbenchmark")
+```{r setup}
+# Load and install required packages for data manipulation, modeling, and visualization
+packages <- c("readxl", "igraph", "R6", "dplyr", "tidyr", "ggplot2", "profvis", "microbenchmark", "data.table")
 install_if_missing <- function(pkg) {
   if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
-    cat("Installing", pkg, "\n")
     install.packages(pkg, repos = "https://cloud.r-project.org")
     library(pkg, character.only = TRUE)
   }
 }
 lapply(packages, install_if_missing)
 
+# A simple null‑coalescing helper
 `%||%` <- function(a, b) if (!is.null(a)) a else b
 ```
 
-## Load Network and Create Graph - Optimized
+```{r read vertex}
+# Read vertex list (semantic network)
+node_file <- "C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S3-Semantic_Network_Ecosystem_Services_25.01.2022.csv"
+nodes_df  <- fread(node_file, skip = 1)
 
-```{r}
-file_path <- "C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S1-SNA_CA_Ecosystem_Services_25.01.2022.csv"
-start_time <- Sys.time()
-cat("Starting to read file at", format(start_time), "\n")
+# ORIGINAL APPROACH - Creates edges ONLY within same group
+# This creates isolated "islands" - each group becomes its own disconnected component
+edges_sim <- nodes_df[, .(Vertex, Group = `Vertex Group`)] |>
+  na.omit() |>
+  group_by(Group) |>
+  summarise(pairs = combn(Vertex, 2, simplify = FALSE), .groups = "drop") |>
+  pull(pairs) |>
+  do.call(what = rbind, args = _) |>
+  as.data.frame()
+colnames(edges_sim) <- c("from", "to")
 
-if(file.exists(file_path)) {
-  cat("Using file:", file_path, "\n")
-  if(require("data.table", quietly = TRUE)) {
-    edges_raw <- fread(file_path, skip = 1)
-    cat("Used data.table::fread for faster reading\n")
-  } else {
-    edges_raw <- read.csv(file_path, skip = 1)
-  }
-  cat("First 3 rows of loaded data:\n")
-  print(head(edges_raw, 3))
-  cat("Number of columns:", ncol(edges_raw), "\n")
-  if(ncol(edges_raw) >= 2) {
-    edges <- data.frame(from = edges_raw[[1]], to = edges_raw[[2]])
-    edges <- unique(na.omit(edges))
-    g <- graph_from_data_frame(edges, directed = TRUE)
-    cat("Graph created with", vcount(g), "vertices and", ecount(g), "edges\n")
-  } else {
-    stop("File doesn't have at least 2 columns for edges")
-  }
-} else {
-  stop(paste("File not found:", file_path))
-}
-end_time <- Sys.time()
-cat("Time taken to create graph:", difftime(end_time, start_time, units = "secs"), "seconds\n")
+# Load additional attribute tables
+s1 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S1-SNA_CA_Ecosystem_Services_25.01.2022.csv", skip = 1)
+s2 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S2-SNA_CA_Ecosystem_Services_03.02.2022.csv",  skip = 1)
+s4 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S4-Semantic_Network_Ecosystem_Services_03.02.2022.csv", skip = 1)
+
+# Build igraph object and attach attributes
+G <- graph_from_data_frame(edges_sim, directed = TRUE, vertices = nodes_df)
+V(G)$centrality <- as.numeric(nodes_df$Betweenness)
+V(G)$belief     <- "neutral"
+V(G)$cluster    <- as.integer(as.factor(nodes_df$`Vertex Group`))
+
+# Identify brokers (top 10 % betweenness)
+cutoff          <- quantile(V(G)$centrality, 0.90, na.rm = TRUE)
+V(G)$is_broker  <- V(G)$centrality >= cutoff
+
+# Attach budgets from table S2
+keywords        <- tolower(V(G)$name)
+lookup          <- setNames(as.numeric(s2$Salience), tolower(s2$Word))
+V(G)$budget     <- lookup[keywords]
+V(G)$budget[is.na(V(G)$budget)] <- mean(V(G)$budget, na.rm = TRUE)
+
+# Pre‑compute neighbour lists for speed
+neighbor_lists <- setNames(lapply(V(G), function(v) names(neighbors(G, v, mode = "all"))), V(G)$name)
 ```
 
-## Assign Attributes and Cluster - Optimized
-
-```{r}
-start_time <- Sys.time()
-
-V(g)$belief <- "neutral"
-V(g)$centrality <- betweenness(g, directed = TRUE)
-g_undirected <- as.undirected(g, mode = "collapse")
-clusters <- cluster_louvain(g_undirected)
-V(g)$cluster <- clusters$membership
-
-neighbor_lists <- list()
-for(v in V(g)) {
-  v_name <- V(g)$name[v]
-  neighbor_lists[[v_name]] <- names(V(g)[neighbors(g, v, mode = "all")])
-}
-
-end_time <- Sys.time()
-cat("Time taken for attributes and pre-calculation:", difftime(end_time, start_time, units = "secs"), "seconds\n")
-```
-
-## Define Agent Classes - Optimized
-
-```{r}
-AgentWithBeliefProb <- R6Class("AgentWithBeliefProb",
+```{r agent classes}
+# Base probabilistic agent --------------------------------------------------
+AgentWithBeliefProb <- R6Class(
+  "AgentWithBeliefProb",
   public = list(
-    id = NULL,
-    name = NULL,
-    belief = "neutral",
-    centrality = NULL,
-
+    id = NULL, name = NULL, belief = "neutral", centrality = NULL, budget = NULL,
     initialize = function(id, name) {
-      self$id <- id
+      self$id   <- id
       self$name <- name
     },
-
-    update_belief = function(neighbor_beliefs, neighbor_centralities = NULL, strategy = "frequency") {
-      if (length(neighbor_beliefs) == 0) return()
+    update_belief = function(nb, nc = NULL, strategy = "frequency") {
+      if (length(nb) == 0) return()
 
       if (strategy == "frequency") {
-        tab <- table(neighbor_beliefs)
-        non_neutral <- tab[names(tab) != "neutral"]
+        freq <- table(nb[nb != "neutral"])
+        if (length(freq) > 0)
+          self$belief <- sample(names(freq), 1, prob = freq / sum(freq))
 
-        if ("supportive" %in% names(non_neutral) && runif(1) < 0.1) {
-          self$belief <- "supportive"
-        } else if ("resistant" %in% names(non_neutral) && runif(1) < 0.1) {
-          self$belief <- "resistant"
-        } else if (length(non_neutral) > 0 && runif(1) < 0.8) {
-          self$belief <- names(which.max(non_neutral))
-        }
-      } else if (strategy == "success") {
-        if (!is.null(neighbor_centralities) && length(neighbor_centralities) > 0) {
-          top <- neighbor_beliefs[which.max(neighbor_centralities)]
-          if (!is.na(top) && top != "neutral") {
-            self$belief <- top
-          }
-        }
+      } else if (strategy == "success" && !is.null(nc)) {
+        top <- nb[which.max(nc)]
+        if (!is.na(top) && top != "neutral") self$belief <- top
       }
     }
   )
 )
 
-# Additional agent behavior strategies (Looser, Majority, Threshold)
-AgentLooser <- R6Class("AgentLooser",
-  inherit = AgentWithBeliefProb,
-  public = list(
-    update_belief = function(neighbor_beliefs, neighbor_centralities = NULL, strategy = "frequency") {
-      if (length(neighbor_beliefs) == 0) return()
-      tab <- table(neighbor_beliefs)
-      non_neutral <- tab[names(tab) != "neutral"]
-      if ("supportive" %in% names(non_neutral) && runif(1) < 0.3) {
-        self$belief <- "supportive"
-      } else if ("resistant" %in% names(non_neutral) && runif(1) < 0.3) {
-        self$belief <- "resistant"
-      } else if (length(non_neutral) > 0 && runif(1) < 0.8) {
-        self$belief <- names(which.max(non_neutral))
-      }
+# Variants ------------------------------------------------------------------
+AgentLooser    <- R6Class("AgentLooser",    inherit = AgentWithBeliefProb)
+AgentMajority  <- R6Class("AgentMajority",  inherit = AgentWithBeliefProb, public = list(
+  update_belief = function(nb, ...) {
+    tab <- table(nb[nb != "neutral"])
+    if (length(tab) > 0 && max(tab) >= 2)
+      self$belief <- names(which.max(tab))
+  }
+))
+AgentThreshold <- R6Class("AgentThreshold", inherit = AgentWithBeliefProb, public = list(
+  update_belief = function(nb, ...) {
+    if (mean(nb == "supportive") > 0.2)      self$belief <- "supportive"
+    else if (mean(nb == "resistant") > 0.2)  self$belief <- "resistant"
+  }
+))
+AgentBroker    <- R6Class("AgentBroker",    inherit = AgentWithBeliefProb, public = list(
+  update_belief = function(nb, ...) {
+    tab <- table(nb[nb != "neutral"])
+    if (any(nb == "neutral") && runif(1) < 0.6) {
+      if ("supportive" %in% names(tab)) self$belief <- "supportive"
+    } else if (length(tab) > 0) {
+      self$belief <- sample(names(tab), 1, prob = tab / sum(tab))
     }
-  )
-)
-
-AgentMajority <- R6Class("AgentMajority",
-  inherit = AgentWithBeliefProb,
-  public = list(
-    update_belief = function(neighbor_beliefs, neighbor_centralities = NULL, strategy = "frequency") {
-      if (length(neighbor_beliefs) == 0) return()
-      tab <- table(neighbor_beliefs)
-      non_neutral <- tab[names(tab) != "neutral"]
-      majority <- names(non_neutral[non_neutral >= 2])
-      if (length(majority) > 0) {
-        self$belief <- sample(majority, 1)
-      }
-    }
-  )
-)
-
-AgentThreshold <- R6Class("AgentThreshold",
-  inherit = AgentWithBeliefProb,
-  public = list(
-    update_belief = function(neighbor_beliefs, neighbor_centralities = NULL, strategy = "frequency") {
-      if (length(neighbor_beliefs) == 0) return()
-      supportive_prop <- sum(neighbor_beliefs == "supportive") / length(neighbor_beliefs)
-      resistant_prop <- sum(neighbor_beliefs == "resistant") / length(neighbor_beliefs)
-      if (supportive_prop > 0.4) {
-        self$belief <- "supportive"
-      } else if (resistant_prop > 0.4) {
-        self$belief <- "resistant"
-      }
-    }
-  )
-)
+  }
+))
 ```
 
-## Create and Seed Agents - Optimized
+```{r diagnose network}
+# NETWORK DIAGNOSIS - CRITICAL STEP!
+# This diagnosis revealed why beliefs weren't spreading:
+# The network was fragmented into 23 separate components with no connections between groups
 
-```{r}
-# Ensure all nodes have names
-if(is.null(V(g)$name)) {
-  V(g)$name <- as.character(1:vcount(g))
+diagnose_network <- function(G) {
+  cat("=== NETWORK DIAGNOSIS ===\n")
+  
+  # Basic stats
+  cat("\nBasic Network Statistics:\n")
+  cat("Nodes:", vcount(G), "\n")
+  cat("Edges:", ecount(G), "\n")
+  cat("Density:", round(edge_density(G), 4), "\n")
+  cat("Average degree:", round(mean(degree(G)), 2), "\n")
+  
+  # Component analysis - THIS IS THE KEY FINDING
+  comp <- components(G)
+  cat("\nComponent Analysis:\n")
+  cat("Number of components:", comp$no, "\n")
+  cat("Largest component size:", max(comp$csize), "\n")
+  cat("Nodes in largest component:", round(100 * max(comp$csize) / vcount(G), 1), "%\n")
+  
+  # Degree distribution
+  deg <- degree(G)
+  cat("\nDegree Distribution:\n")
+  cat("Isolated nodes (degree 0):", sum(deg == 0), "\n")
+  cat("Low degree nodes (degree 1-2):", sum(deg >= 1 & deg <= 2), "\n")
+  cat("High degree nodes (degree > 10):", sum(deg > 10), "\n")
+  
+  # Broker analysis
+  brokers <- which(V(G)$is_broker)
+  cat("\nBroker Analysis:\n")
+  cat("Number of brokers:", length(brokers), "\n")
+  cat("Average broker degree:", round(mean(degree(G)[brokers]), 2), "\n")
+  
+  # Visualization of degree distribution
+  hist(deg, main = "Degree Distribution", xlab = "Degree", col = "lightblue", breaks = 20)
 }
 
-agents <- vector("list", vcount(g))
-names(agents) <- V(g)$name
+# Run diagnosis on original network
+cat("ORIGINAL NETWORK (Problem: 23 disconnected components!):\n")
+diagnose_network(G)
 
-for (i in seq_len(vcount(g))) {
-  name <- V(g)$name[i]
-  if (!is.na(name)) {
-    a <- AgentWithBeliefProb$new(id = i, name = name)
-    a$belief <- V(g)$belief[i]
-    a$centrality <- V(g)$centrality[i]
-    agents[[name]] <- a
+# THE DIAGNOSIS REVEALED:
+# - 23 separate components (isolated islands)
+# - Largest component only has 24 nodes (11.5% of network)
+# - Beliefs can't spread between components
+# - This explains the "flat line" problem - beliefs hit component boundaries and stop
+```
+
+```{r create better network}
+# SOLUTION: Create inter-group connections to unite the network
+# We keep within-group connections but add bridges between groups
+
+create_connected_network <- function(nodes_df) {
+  # Step 1: Keep original within-group edges (maintains group cohesion)
+  edges_within <- nodes_df[, .(Vertex, Group = `Vertex Group`)] |>
+    na.omit() |>
+    group_by(Group) |>
+    summarise(pairs = combn(Vertex, 2, simplify = FALSE), .groups = "drop") |>
+    pull(pairs) |>
+    do.call(what = rbind, args = _) |>
+    as.data.frame()
+  colnames(edges_within) <- c("from", "to")
+  
+  # Step 2: Add bridges between groups (KEY INNOVATION)
+  # This connects the isolated islands into one network
+  groups <- unique(na.omit(nodes_df$`Vertex Group`))
+  edges_between <- list()
+  
+  for (i in 1:(length(groups)-1)) {
+    for (j in (i+1):length(groups)) {
+      # Get nodes from each group
+      nodes_g1 <- nodes_df$Vertex[nodes_df$`Vertex Group` == groups[i]]
+      nodes_g2 <- nodes_df$Vertex[nodes_df$`Vertex Group` == groups[j]]
+      
+      # Create 3 random connections between each pair of groups
+      # This ensures beliefs can flow between all groups
+      n_connections <- min(3, length(nodes_g1), length(nodes_g2))
+      for (k in 1:n_connections) {
+        from_node <- sample(nodes_g1, 1)
+        to_node <- sample(nodes_g2, 1)
+        edges_between[[length(edges_between) + 1]] <- c(from_node, to_node)
+      }
+    }
   }
+  
+  # Combine within-group and between-group edges
+  edges_between_df <- do.call(rbind, edges_between)
+  colnames(edges_between_df) <- c("from", "to")
+  
+  all_edges <- rbind(edges_within, edges_between_df)
+  return(all_edges)
 }
 
+# Create new connected network
+edges_connected <- create_connected_network(nodes_df)
+
+# Build improved graph
+G_connected <- graph_from_data_frame(edges_connected, directed = FALSE, vertices = nodes_df)
+
+# Copy and update attributes
+V(G_connected)$centrality <- as.numeric(nodes_df$Betweenness)
+V(G_connected)$belief     <- "neutral"
+V(G_connected)$cluster    <- as.integer(as.factor(nodes_df$`Vertex Group`))
+
+# Recalculate centrality for the new network structure
+new_centrality <- betweenness(G_connected)
+V(G_connected)$centrality <- new_centrality
+cutoff <- quantile(V(G_connected)$centrality, 0.90, na.rm = TRUE)
+V(G_connected)$is_broker  <- V(G_connected)$centrality >= cutoff
+
+# Attach budgets
+keywords <- tolower(V(G_connected)$name)
+lookup <- setNames(as.numeric(s2$Salience), tolower(s2$Word))
+V(G_connected)$budget <- lookup[keywords]
+V(G_connected)$budget[is.na(V(G_connected)$budget)] <- mean(V(G_connected)$budget, na.rm = TRUE)
+
+# Update neighbor lists for the connected network
+neighbor_lists <- setNames(lapply(V(G_connected), function(v) names(neighbors(G_connected, v, mode = "all"))), V(G_connected)$name)
+
+# Diagnose the improved network
+cat("\n\nIMPROVED NETWORK (Solution: Added inter-group bridges):\n")
+diagnose_network(G_connected)
+
+# Replace the fragmented network with the connected one
+G <- G_connected
+```
+
+```{r simulation functions}
+# Simulation function without early stopping
+run_simulation_no_convergence <- function(graph, agents, n_seeds = 5, max_time = 50, update_strategy = "frequency") {
+  # Randomly seed initial beliefs
+  seed_ids <- sample(V(graph), n_seeds, replace = FALSE)
+  for (v in seed_ids) {
+    agents[[v]]$belief <- sample(c("supportive", "resistant"), 1)
+  }
+  
+  # Store results
+  results <- list()
+  
+  # Time loop - run full simulation
+  for (t in 1:max_time) {
+    # Snapshot current state
+    snapshot <- data.frame(
+      time = t,
+      agent_id = sapply(agents, function(a) a$id),
+      name = sapply(agents, function(a) a$name),
+      belief = sapply(agents, function(a) a$belief),
+      centrality = sapply(agents, function(a) a$centrality),
+      budget = sapply(agents, function(a) a$budget),
+      stringsAsFactors = FALSE
+    )
+    results[[t]] <- snapshot
+    
+    # Update beliefs based on neighbors
+    new_beliefs <- character(length(agents))
+    
+    for (i in seq_along(agents)) {
+      agent <- agents[[i]]
+      neighbors <- neighbor_lists[[agent$name]]
+      
+      if (length(neighbors) > 0) {
+        neighbor_beliefs <- sapply(neighbors, function(n) {
+          n_idx <- which(V(graph)$name == n)
+          if (length(n_idx) > 0) agents[[n_idx]]$belief else "neutral"
+        })
+        
+        neighbor_centralities <- sapply(neighbors, function(n) {
+          n_idx <- which(V(graph)$name == n)
+          if (length(n_idx) > 0) agents[[n_idx]]$centrality else 0
+        })
+        
+        # Update belief
+        agent$update_belief(neighbor_beliefs, neighbor_centralities, update_strategy)
+        
+        # Store new belief
+        new_beliefs[i] <- agent$belief
+      } else {
+        new_beliefs[i] <- agent$belief
+      }
+    }
+    
+    # Apply all updates simultaneously
+    for (i in seq_along(agents)) {
+      agents[[i]]$belief <- new_beliefs[i]
+    }
+  }
+  
+  return(bind_rows(results))
+}
+
+# Define scenarios
+scenarios <- list(
+  "Probabilistic" = function(v) {
+    agent <- AgentWithBeliefProb$new(v, V(G)$name[v])
+    agent$centrality <- V(G)$centrality[v]
+    agent$budget <- V(G)$budget[v]
+    agent$belief <- V(G)$belief[v]
+    agent
+  },
+  "Majority Rule" = function(v) {
+    agent <- AgentMajority$new(v, V(G)$name[v])
+    agent$centrality <- V(G)$centrality[v]
+    agent$budget <- V(G)$budget[v]
+    agent$belief <- V(G)$belief[v]
+    agent
+  },
+  "Threshold" = function(v) {
+    agent <- AgentThreshold$new(v, V(G)$name[v])
+    agent$centrality <- V(G)$centrality[v]
+    agent$budget <- V(G)$budget[v]
+    agent$belief <- V(G)$belief[v]
+    agent
+  },
+  "Mixed (Brokers)" = function(v) {
+    if (V(G)$is_broker[v]) {
+      agent <- AgentBroker$new(v, V(G)$name[v])
+    } else {
+      agent <- AgentWithBeliefProb$new(v, V(G)$name[v])
+    }
+    agent$centrality <- V(G)$centrality[v]
+    agent$budget <- V(G)$budget[v]
+    agent$belief <- V(G)$belief[v]
+    agent
+  }
+)
+
+# Run simulations with the connected network
 set.seed(123)
-seed_supportive <- c()
-seed_resistant <- c()
+results_all <- list()
 
-for (cl in unique(V(g)$cluster)) {
-  members <- which(V(g)$cluster == cl)
-  centrality_values <- V(g)$centrality[members]
-  ordered_indices <- order(centrality_values, decreasing = TRUE)
-  top_members <- members[ordered_indices]
-  pick_n <- max(1, round(0.05 * length(members)))
-  half_n <- floor(pick_n / 2)
-  seed_supportive <- c(seed_supportive, head(top_members, half_n))
-  seed_resistant <- c(seed_resistant, tail(top_members, pick_n - half_n))
+cat("\n\nRunning simulations on CONNECTED network...\n")
+
+for (scenario_name in names(scenarios)) {
+  message("Running scenario: ", scenario_name)
+  
+  # Create agents for this scenario
+  agents <- lapply(seq_len(vcount(G)), scenarios[[scenario_name]])
+  
+  # Run simulation - now beliefs can spread throughout the network!
+  result <- run_simulation_no_convergence(G, agents, n_seeds = 10, max_time = 50)
+  result$scenario <- scenario_name
+  
+  results_all[[scenario_name]] <- result
 }
 
-for (i in seed_supportive) {
-  agents[[V(g)$name[i]]]$belief <- "supportive"
-}
-for (i in seed_resistant) {
-  agents[[V(g)$name[i]]]$belief <- "resistant"
-}
+# Combine all results
+results_all <- bind_rows(results_all)
+
+# Print summary
+cat("\nSimulation complete. Summary:\n")
+print(table(results_all$scenario, results_all$belief))
 ```
 
-## Run Simulation Function
-
-```{r}
-run_simulation <- function(agent_class, strategy = "frequency", steps = 50, label = "Default") {
-  agents <- vector("list", vcount(g))
-  names(agents) <- V(g)$name
-
-  for (i in seq_len(vcount(g))) {
-    name <- V(g)$name[i]
-    a <- agent_class$new(id = i, name = name)
-    a$belief <- V(g)$belief[i]
-    a$centrality <- V(g)$centrality[i]
-    agents[[name]] <- a
-  }
-
-  for (i in seed_supportive) agents[[V(g)$name[i]]]$belief <- "supportive"
-  for (i in seed_resistant) agents[[V(g)$name[i]]]$belief <- "resistant"
-
-  agent_names <- names(agents)
-  belief_matrix <- matrix("", nrow = length(agent_names), ncol = steps)
-  rownames(belief_matrix) <- agent_names
-
-  agent_beliefs <- sapply(agents, function(a) a$belief)
-  agent_centralities <- sapply(agents, function(a) a$centrality)
-
-  for (t in 1:steps) {
-    belief_matrix[,t] <- agent_beliefs
-    new_beliefs <- agent_beliefs
-
-    for (agent_name in agent_names) {
-      agent <- agents[[agent_name]]
-      neighbor_names <- neighbor_lists[[agent_name]]
-      if (length(neighbor_names) > 0) {
-        neighbor_beliefs <- agent_beliefs[neighbor_names]
-        neighbor_centralities <- agent_centralities[neighbor_names]
-        agent$update_belief(neighbor_beliefs, neighbor_centralities, strategy)
-        new_beliefs[agent_name] <- agent$belief
-      }
-    }
-    agent_beliefs <- new_beliefs
-    for (name in agent_names) agents[[name]]$belief <- agent_beliefs[name]
-  }
-
-  data.frame(
-    time = rep(1:steps, each = length(agent_names)),
-    agent = rep(agent_names, times = steps),
-    belief = as.vector(belief_matrix),
-    scenario = label
-  )
-}
-```
-
-## Run All Scenarios
-
-```{r}
-result1 <- run_simulation(AgentWithBeliefProb, label = "Default")
-result2 <- run_simulation(AgentLooser, label = "HigherChance")
-result3 <- run_simulation(AgentMajority, label = "MajorityRule")
-result4 <- run_simulation(AgentThreshold, label = "ThresholdRule")
-
-
-results_all <- do.call(rbind, list(result1, result2, result3, result4))
-```
-
-## Visualize Scenario Results
-
-```{r}
-belief_summary <- results_all %>%
-  group_by(time, scenario, belief) %>%
-  summarise(count = n(), .groups = "drop") %>%
-  group_by(time, scenario) %>%
+```{r visualization}
+# Create visualization
+belief_summary <- results_all |>
+  group_by(time, scenario, belief) |>
+  summarise(count = n(), .groups = "drop") |>
+  group_by(time, scenario) |>
   mutate(prop = count / sum(count))
 
-p <- ggplot(belief_summary, aes(x = time, y = prop, color = belief)) +
+# Plot with full time series
+# Now we should see actual belief diffusion instead of flat lines!
+ggplot(belief_summary, aes(time, prop, colour = belief)) +
   geom_line(linewidth = 1.2) +
   facet_wrap(~scenario) +
+  scale_colour_manual(values = c(neutral = "grey", supportive = "blue", resistant = "red")) +
+  scale_x_continuous(breaks = seq(0, 50, by = 10)) +
   labs(
-    title = "Belief Diffusion Over Time by Scenario",
-    x = "Time Step",
-    y = "Proportion of Agents",
-    color = "Belief"
+    title = "Belief Diffusion with Connected Network\n(Fixed: Added bridges between isolated groups)",
+    x = "Time step",
+    y = "Proportion of agents",
+    colour = "Belief"
   ) +
-  scale_color_manual(values = c("neutral" = "gray", "supportive" = "blue", "resistant" = "red")) +
   theme_minimal()
-
-print(p)
 ```
