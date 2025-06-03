@@ -22,7 +22,8 @@ lapply(packages, install_if_missing)
 
 ```{r read vertex}
 # Read vertex list (semantic network)
-node_file <- "C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S3-Semantic_Network_Ecosystem_Services_25.01.2022.csv"
+# Using relative paths - assumes files are in the same directory as this script
+node_file <- "Table S3-Semantic_Network_Ecosystem_Services_25.01.2022.csv"
 nodes_df  <- fread(node_file, skip = 1)
 
 # ORIGINAL APPROACH - Creates edges ONLY within same group
@@ -36,10 +37,10 @@ edges_sim <- nodes_df[, .(Vertex, Group = `Vertex Group`)] |>
   as.data.frame()
 colnames(edges_sim) <- c("from", "to")
 
-# Load additional attribute tables
-s1 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S1-SNA_CA_Ecosystem_Services_25.01.2022.csv", skip = 1)
-s2 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S2-SNA_CA_Ecosystem_Services_03.02.2022.csv",  skip = 1)
-s4 <- fread("C:/Users/engin/OneDrive/Desktop/Carpetas/STANFORD/SixthQuarter/EB282/Project/Table S4-Semantic_Network_Ecosystem_Services_03.02.2022.csv", skip = 1)
+# Load additional attribute tables using relative paths
+s1 <- fread("Table S1-SNA_CA_Ecosystem_Services_25.01.2022.csv", skip = 1)
+s2 <- fread("Table S2-SNA_CA_Ecosystem_Services_03.02.2022.csv", skip = 1)
+s4 <- fread("Table S4-Semantic_Network_Ecosystem_Services_03.02.2022.csv", skip = 1)
 
 # Build igraph object and attach attributes
 G <- graph_from_data_frame(edges_sim, directed = TRUE, vertices = nodes_df)
