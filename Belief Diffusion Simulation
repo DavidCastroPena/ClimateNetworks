@@ -1,14 +1,6 @@
 ---
 title: "Belief Diffusion Simulation - Fixed Network Connectivity"
 author: "David Castro"
-format:
-  html: default
----
----
-title: "Belief Diffusion Simulation - Fixed Network Connectivity"
-author: "David Castro"
-format:
-  html: default
 ---
 
 ```{r setup}
